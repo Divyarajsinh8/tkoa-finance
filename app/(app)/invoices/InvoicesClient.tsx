@@ -20,6 +20,7 @@ interface Props {
 type UploadState =
   | { phase: "idle" }
   | { phase: "uploading" }
+  | { phase: "analyzing"; filePath: string; mimeType: string }
   | { phase: "saved"; invoice: Invoice; transaction: unknown | null; category: string }
   | { phase: "manual"; filePath: string; reason: string; invoiceId?: string; transactionId?: string }
   | { phase: "error"; message: string };
@@ -68,27 +69,59 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
     if (!perms.canCreate) return;
     setUploadState({ phase: "uploading" });
 
+    // ── Step 1: Upload file to storage (fast, instant response) ───────────
     const formData = new FormData();
     formData.append("file", file);
 
+    let filePath: string;
+    let mimeType: string;
     try {
-      const res = await fetch("/api/invoices/process", { method: "POST", body: formData });
-      const data = await res.json();
+      const uploadRes = await fetch("/api/invoices/upload", { method: "POST", body: formData });
+      const uploadText = await uploadRes.text();
+      console.log("[invoices/upload] raw response:", uploadText);
+      const uploadData = JSON.parse(uploadText);
 
-      if (!res.ok) {
-        setUploadState({ phase: "error", message: data.error ?? `Server error ${res.status}` });
+      if (!uploadRes.ok) {
+        setUploadState({ phase: "error", message: uploadData.error ?? `Upload error ${uploadRes.status}` });
+        return;
+      }
+      if (!uploadData.file_path) {
+        setUploadState({ phase: "error", message: `Unexpected upload response: ${uploadText.slice(0, 200)}` });
+        return;
+      }
+      filePath = uploadData.file_path;
+      mimeType = uploadData.mime_type;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setUploadState({ phase: "error", message: `Upload failed: ${msg}` });
+      return;
+    }
+
+    // ── Step 2: Run AI analysis (slower, separate request) ─────────────────
+    setUploadState({ phase: "analyzing", filePath, mimeType });
+
+    try {
+      const analyzeRes = await fetch("/api/invoices/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_path: filePath, mime_type: mimeType }),
+      });
+      const analyzeText = await analyzeRes.text();
+      console.log("[invoices/analyze] raw response:", analyzeText);
+      const data = JSON.parse(analyzeText);
+
+      if (!analyzeRes.ok) {
+        setUploadState({ phase: "error", message: data.error ?? `Analysis error ${analyzeRes.status}` });
         return;
       }
 
       if (data.auto_saved && data.invoice) {
-        // Full success — AI extracted + auto-saved
         setInvoices(prev => [data.invoice as Invoice, ...prev]);
         setUploadState({ phase: "saved", invoice: data.invoice as Invoice, transaction: data.transaction ?? null, category: data.category ?? "" });
         return;
       }
 
       if (data.ai_failed) {
-        // File uploaded but AI failed — show manual form pre-filled if ai_data available
         const aiData = data.ai_data as Record<string, unknown> | undefined;
         if (aiData) {
           setManualForm({
@@ -106,16 +139,18 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
         }
         setUploadState({
           phase: "manual",
-          filePath: data.file_path ?? "",
+          filePath: data.file_path ?? filePath,
           reason: data.error ?? "AI extraction failed — please fill in the details.",
         });
         return;
       }
 
-      setUploadState({ phase: "error", message: "Unexpected response from server." });
+      // Neither auto_saved nor ai_failed — log what we got
+      console.error("[invoices/analyze] unexpected shape:", analyzeText.slice(0, 500));
+      setUploadState({ phase: "error", message: `Unexpected response: ${analyzeText.slice(0, 200)}` });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setUploadState({ phase: "error", message: `Network error: ${msg}` });
+      setUploadState({ phase: "error", message: `Analysis failed: ${msg}` });
     }
   }
 
@@ -236,7 +271,7 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
-  const isUploading = uploadState.phase === "uploading";
+  const isUploading = uploadState.phase === "uploading" || uploadState.phase === "analyzing";
 
   return (
     <div className="space-y-4 max-w-7xl">
@@ -255,7 +290,7 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
                 <polyline points="17 8 12 3 7 8" />
                 <line x1="12" y1="3" x2="12" y2="15" />
               </svg>
-              {isUploading ? "Uploading…" : "Upload Invoice"}
+              {uploadState.phase === "uploading" ? "Uploading…" : uploadState.phase === "analyzing" ? "Analyzing…" : "Upload Invoice"}
             </button>
             <input
               ref={fileInputRef}
@@ -299,6 +334,20 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
           <div>
             <p className="text-white/70 text-sm font-medium">Uploading & processing…</p>
             <p className="text-white/30 text-xs mt-0.5">Saving to storage, then running AI extraction</p>
+          </div>
+        </div>
+      )}
+
+      {/* Analyzing spinner — file uploaded, Claude running */}
+      {uploadState.phase === "analyzing" && (
+        <div className="card-base p-6 flex items-center gap-4">
+          <svg className="animate-spin w-6 h-6 text-[#DC3C3C] shrink-0" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          <div>
+            <p className="text-white/70 text-sm font-medium">Analyzing with AI…</p>
+            <p className="text-white/30 text-xs mt-0.5">File saved — extracting vendor, amount, GST. This may take up to 30s.</p>
           </div>
         </div>
       )}

@@ -4,34 +4,7 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-export async function processInvoice(
-  fileBuffer: Buffer,
-  mimeType: string
-): Promise<Record<string, unknown>> {
-  const validMimeTypes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
-
-  if (!validMimeTypes.includes(mimeType)) {
-    throw new Error(`Unsupported image type: ${mimeType}. PDF processing requires conversion first.`);
-  }
-
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 2000,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
-              data: fileBuffer.toString("base64"),
-            },
-          },
-          {
-            type: "text",
-            text: `Extract all financial details from this invoice. Return ONLY valid JSON with no markdown:
+const INVOICE_PROMPT = `Extract all financial details from this invoice/receipt. Return ONLY valid JSON with no markdown fences, no explanation:
 {
   "vendor_name": "",
   "vendor_gstin": "",
@@ -46,15 +19,65 @@ export async function processInvoice(
   "currency": "INR",
   "payment_terms": "",
   "suggested_category": ""
-}`,
-          },
+}
+
+All monetary values in rupees (not paise). If currency is USD/EUR, convert to INR at approximate current rate and note in payment_terms. Return null for fields not present.`;
+
+export async function processInvoice(
+  fileBuffer: Buffer,
+  mimeType: string
+): Promise<Record<string, unknown>> {
+  const supportedImages = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+  const isPDF = mimeType === "application/pdf";
+
+  if (!supportedImages.includes(mimeType) && !isPDF) {
+    throw new Error(`Unsupported file type: ${mimeType}`);
+  }
+
+  // Build the file content block — PDFs use "document" type, images use "image" type
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fileBlock: any = isPDF
+    ? {
+        type: "document",
+        source: {
+          type: "base64",
+          media_type: "application/pdf",
+          data: fileBuffer.toString("base64"),
+        },
+      }
+    : {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: mimeType,
+          data: fileBuffer.toString("base64"),
+        },
+      };
+
+  const response = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20250414",
+    max_tokens: 2000,
+    messages: [
+      {
+        role: "user",
+        content: [
+          fileBlock,
+          { type: "text", text: INVOICE_PROMPT },
         ],
       },
     ],
   });
 
-  const text = response.content[0].type === "text" ? response.content[0].text : "";
-  return JSON.parse(text);
+  let text = response.content[0].type === "text" ? response.content[0].text.trim() : "";
+
+  // Strip markdown code fences Claude sometimes adds despite instructions
+  text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Claude returned non-JSON: ${text.slice(0, 200)}`);
+  }
 }
 
 export async function askAIAdvisor(
@@ -92,8 +115,9 @@ export async function generateInsights(
   });
 
   const text = response.content[0].type === "text" ? response.content[0].text : "[]";
+  const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
   try {
-    return JSON.parse(text);
+    return JSON.parse(cleaned);
   } catch {
     return ["Unable to generate insights at this time."];
   }
