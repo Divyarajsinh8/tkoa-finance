@@ -20,8 +20,8 @@ interface Props {
 type UploadState =
   | { phase: "idle" }
   | { phase: "uploading" }
-  | { phase: "ai_success"; aiData: Record<string, unknown>; filePath: string }
-  | { phase: "manual"; filePath: string; reason: string }  // AI failed or skipped
+  | { phase: "saved"; invoice: Invoice; transaction: unknown | null; category: string }
+  | { phase: "manual"; filePath: string; reason: string; invoiceId?: string; transactionId?: string }
   | { phase: "error"; message: string };
 
 interface ManualForm {
@@ -76,35 +76,39 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
       const data = await res.json();
 
       if (!res.ok) {
-        // Hard failure (4xx/5xx with error message)
         setUploadState({ phase: "error", message: data.error ?? `Server error ${res.status}` });
         return;
       }
 
-      if (data.ai_data) {
-        // Full success — AI extracted data
-        setUploadState({ phase: "ai_success", aiData: data.ai_data, filePath: data.file_path });
-        // Pre-fill manual form with AI values as fallback
-        setManualForm(f => ({
-          ...f,
-          vendor: String(data.ai_data.vendor_name ?? ""),
-          amount: String((data.ai_data.total_amount as number ?? 0) / 100),
-          gst_amount: String((data.ai_data.gst_amount as number ?? 0) / 100),
-          date: String(data.ai_data.invoice_date ?? f.date),
-          due_date: String(data.ai_data.due_date ?? ""),
-          category: String(data.ai_data.suggested_category ?? ""),
-        }));
+      if (data.auto_saved && data.invoice) {
+        // Full success — AI extracted + auto-saved
+        setInvoices(prev => [data.invoice as Invoice, ...prev]);
+        setUploadState({ phase: "saved", invoice: data.invoice as Invoice, transaction: data.transaction ?? null, category: data.category ?? "" });
         return;
       }
 
-      if (data.ai_failed || data.ai_skipped) {
-        // File uploaded, but AI couldn't process it
+      if (data.ai_failed) {
+        // File uploaded but AI failed — show manual form pre-filled if ai_data available
+        const aiData = data.ai_data as Record<string, unknown> | undefined;
+        if (aiData) {
+          setManualForm({
+            vendor: String(aiData.vendor_name ?? ""),
+            type: "payable",
+            amount: String(Number(aiData.total_amount ?? 0)),
+            gst_amount: String(Number(aiData.gst_amount ?? 0)),
+            date: String(aiData.invoice_date ?? new Date().toISOString().split("T")[0]),
+            due_date: aiData.due_date && aiData.due_date !== "null" ? String(aiData.due_date) : "",
+            category: String(aiData.suggested_category ?? ""),
+            notes: "",
+          });
+        } else {
+          setManualForm(EMPTY_FORM);
+        }
         setUploadState({
           phase: "manual",
-          filePath: data.file_path,
-          reason: data.error ?? data.message ?? "AI extraction was skipped.",
+          filePath: data.file_path ?? "",
+          reason: data.error ?? "AI extraction failed — please fill in the details.",
         });
-        setManualForm(EMPTY_FORM);
         return;
       }
 
@@ -115,36 +119,79 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
     }
   }
 
-  async function saveManualInvoice(filePath: string) {
+  async function saveManualInvoice(filePath: string, invoiceId?: string, transactionId?: string) {
     if (!manualForm.vendor.trim()) return;
     setSaving(true);
     try {
       const amount = Math.round(parseFloat(manualForm.amount || "0") * 100);
       const gstAmount = Math.round(parseFloat(manualForm.gst_amount || "0") * 100);
+      const userId = (await supabase.auth.getUser()).data.user?.id;
 
-      const { data, error } = await supabase
-        .from("invoices")
-        .insert({
-          invoice_number: `INV-${Date.now()}`,
-          type: manualForm.type,
-          vendor: manualForm.vendor.trim(),
-          amount,
-          gst_amount: gstAmount,
-          date: manualForm.date,
-          due_date: manualForm.due_date || null,
-          status: "pending",
-          category: manualForm.category || null,
-          notes: manualForm.notes || null,
-          file_path: filePath,
-          created_by: (await supabase.auth.getUser()).data.user?.id,
-        })
-        .select()
-        .single();
+      if (invoiceId) {
+        // UPDATE existing invoice
+        const { data, error } = await supabase
+          .from("invoices")
+          .update({
+            type: manualForm.type,
+            vendor: manualForm.vendor.trim(),
+            amount,
+            gst_amount: gstAmount,
+            date: manualForm.date,
+            due_date: manualForm.due_date || null,
+            category: manualForm.category || null,
+            notes: manualForm.notes || null,
+          })
+          .eq("id", invoiceId)
+          .select()
+          .single();
 
-      if (error) throw new Error(error.message);
-      setInvoices(prev => [data as Invoice, ...prev]);
-      setUploadState({ phase: "idle" });
-      setManualForm(EMPTY_FORM);
+        if (error) throw new Error(error.message);
+
+        // Update linked transaction if present
+        if (transactionId) {
+          await supabase
+            .from("transactions")
+            .update({
+              type: manualForm.type === "payable" ? "expense" : "income",
+              category: manualForm.category || null,
+              vendor: manualForm.vendor.trim(),
+              amount,
+              gst_amount: gstAmount,
+              date: manualForm.date,
+            })
+            .eq("id", transactionId);
+        }
+
+        setInvoices(prev => prev.map(inv => inv.id === invoiceId ? (data as Invoice) : inv));
+        setUploadState({ phase: "idle" });
+        setManualForm(EMPTY_FORM);
+      } else {
+        // INSERT new invoice
+        const invoiceNumber = `INV-${Date.now()}`;
+        const { data, error } = await supabase
+          .from("invoices")
+          .insert({
+            invoice_number: invoiceNumber,
+            type: manualForm.type,
+            vendor: manualForm.vendor.trim(),
+            amount,
+            gst_amount: gstAmount,
+            date: manualForm.date,
+            due_date: manualForm.due_date || null,
+            status: "paid",
+            category: manualForm.category || null,
+            notes: manualForm.notes || null,
+            file_path: filePath,
+            created_by: userId,
+          })
+          .select()
+          .single();
+
+        if (error) throw new Error(error.message);
+        setInvoices(prev => [data as Invoice, ...prev]);
+        setUploadState({ phase: "idle" });
+        setManualForm(EMPTY_FORM);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setUploadState(prev =>
@@ -155,6 +202,26 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
     } finally {
       setSaving(false);
     }
+  }
+
+  function enterEditMode(invoice: Invoice, transactionId?: string) {
+    setManualForm({
+      vendor: invoice.vendor ?? "",
+      type: invoice.type as "payable" | "receivable",
+      amount: String((invoice.amount ?? 0) / 100),
+      gst_amount: String((invoice.gst_amount ?? 0) / 100),
+      date: invoice.date ?? new Date().toISOString().split("T")[0],
+      due_date: invoice.due_date ?? "",
+      category: invoice.category ?? "",
+      notes: (invoice as Invoice & { notes?: string }).notes ?? "",
+    });
+    setUploadState({
+      phase: "manual",
+      filePath: invoice.file_path ?? "",
+      reason: "Editing saved invoice",
+      invoiceId: invoice.id,
+      transactionId,
+    });
   }
 
   function handleDrop(e: React.DragEvent) {
@@ -217,7 +284,7 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
               </svg>
             </div>
             <p className="text-white/50 text-sm">Drop invoice PDF or image here</p>
-            <p className="text-white/25 text-xs">AI extracts vendor, amount, GST automatically · PDF, JPEG, PNG, WebP</p>
+            <p className="text-white/25 text-xs">AI extracts vendor, amount, GST and saves automatically · PDF, JPEG, PNG, WebP</p>
           </div>
         </div>
       )}
@@ -254,44 +321,74 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
         </div>
       )}
 
-      {/* AI success — extracted data preview */}
-      {uploadState.phase === "ai_success" && (
-        <div className="card-base p-4 border border-[#DC3C3C]/20 animate-slide-up">
-          <div className="flex items-center justify-between mb-3">
+      {/* Auto-save success card */}
+      {uploadState.phase === "saved" && (
+        <div className="card-base p-5 border border-green-500/20 animate-slide-up">
+          <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-[#DC3C3C] animate-pulse" />
-              <span className="text-sm font-medium text-white">AI Extracted Data</span>
+              <div className="w-5 h-5 rounded-full bg-green-500/20 flex items-center justify-center shrink-0">
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+              <span className="text-sm font-semibold text-white">Invoice saved automatically</span>
             </div>
-            <button onClick={dismissUpload} className="text-white/30 hover:text-white/60 cursor-pointer transition-colors text-xs">Dismiss</button>
+            <button onClick={dismissUpload} className="text-white/30 hover:text-white/60 cursor-pointer transition-colors text-xs">Done</button>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs mb-4">
-            {Object.entries(uploadState.aiData)
-              .filter(([k]) => !["line_items"].includes(k))
-              .map(([k, v]) => (
-                <div key={k}>
-                  <p className="data-label">{k.replace(/_/g, " ")}</p>
-                  <p className="font-mono text-white/80 text-xs mt-0.5">{String(v) || "—"}</p>
-                </div>
-              ))}
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
+            <div>
+              <p className="data-label">Vendor</p>
+              <p className="text-white/80 text-sm font-medium mt-0.5">{uploadState.invoice.vendor}</p>
+            </div>
+            <div>
+              <p className="data-label">Amount</p>
+              <p className="font-mono text-white text-sm font-bold mt-0.5">{formatINR(uploadState.invoice.amount, true)}</p>
+              {uploadState.invoice.gst_amount > 0 && (
+                <p className="font-mono text-white/30 text-[10px]">+ {formatINR(uploadState.invoice.gst_amount, true)} GST</p>
+              )}
+            </div>
+            <div>
+              <p className="data-label">Category</p>
+              <p className="text-white/80 text-sm mt-0.5">{uploadState.category || uploadState.invoice.category || "—"}</p>
+            </div>
+            <div>
+              <p className="data-label">Date</p>
+              <p className="font-mono text-white/80 text-sm mt-0.5">{formatDate(uploadState.invoice.date)}</p>
+            </div>
           </div>
+
+          {!!uploadState.transaction && (
+            <p className="text-green-400/60 text-xs mb-4">
+              Transaction auto-created and linked
+            </p>
+          )}
+
           <div className="flex gap-2">
             <button
-              onClick={() => setUploadState({ phase: "manual", filePath: uploadState.filePath, reason: "Edit AI-extracted data before saving" })}
-              className="btn-primary py-1.5 px-3 text-xs cursor-pointer"
+              onClick={() => enterEditMode(
+                uploadState.invoice,
+                uploadState.transaction ? (uploadState.transaction as { id?: string }).id : undefined
+              )}
+              className="btn-ghost py-1.5 px-3 text-xs cursor-pointer border border-white/[0.08]"
             >
-              Review & Save Invoice
+              Edit
             </button>
-            <button onClick={dismissUpload} className="btn-ghost py-1.5 px-3 text-xs cursor-pointer">Discard</button>
+            <button onClick={dismissUpload} className="btn-primary py-1.5 px-3 text-xs cursor-pointer">
+              Done
+            </button>
           </div>
         </div>
       )}
 
-      {/* Manual entry form — shown when AI fails, skips, or user clicks "Review & Save" */}
+      {/* Manual entry / edit form */}
       {uploadState.phase === "manual" && (
         <div className="card-base p-5 animate-slide-up">
           <div className="flex items-start justify-between mb-4">
             <div>
-              <h3 className="section-title">Invoice Details</h3>
+              <h3 className="section-title">
+                {uploadState.invoiceId ? "Edit Invoice" : "Invoice Details"}
+              </h3>
               <p className="text-white/30 text-xs mt-0.5">{uploadState.reason}</p>
             </div>
             <button onClick={dismissUpload} className="text-white/30 hover:text-white/60 text-xs cursor-pointer">Cancel</button>
@@ -405,22 +502,23 @@ export function InvoicesClient({ invoices: initialInvoices = [], role }: Props) 
             </div>
           </div>
 
-          {/* File path indicator */}
-          <div className="mt-3 flex items-center gap-2 text-xs text-white/25">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-              <polyline points="14 2 14 8 20 8" />
-            </svg>
-            File saved: <span className="font-mono">{uploadState.filePath}</span>
-          </div>
+          {uploadState.filePath && (
+            <div className="mt-3 flex items-center gap-2 text-xs text-white/25">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+              File saved: <span className="font-mono">{uploadState.filePath}</span>
+            </div>
+          )}
 
           <div className="flex gap-2 mt-4">
             <button
-              onClick={() => saveManualInvoice(uploadState.filePath)}
+              onClick={() => saveManualInvoice(uploadState.filePath, uploadState.invoiceId, uploadState.transactionId)}
               disabled={saving || !manualForm.vendor.trim() || !manualForm.amount}
               className="btn-primary py-2 px-4 text-sm disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
-              {saving ? "Saving…" : "Save Invoice"}
+              {saving ? "Saving…" : uploadState.invoiceId ? "Update Invoice" : "Save Invoice"}
             </button>
             <button onClick={dismissUpload} className="btn-ghost py-2 px-4 text-sm cursor-pointer">Discard</button>
           </div>
