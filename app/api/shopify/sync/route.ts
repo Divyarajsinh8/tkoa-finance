@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchShopifyOrders } from "@/lib/shopify";
+import { fetchAllShopifyOrders, getShopifyStores } from "@/lib/shopify";
 import { createClient } from "@/lib/supabase/server";
 
 export async function POST(request: NextRequest) {
@@ -7,7 +7,6 @@ export async function POST(request: NextRequest) {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  // Only admins/managers can sync
   const { data: profile } = await supabase.from("users").select("role").single();
   if (!["admin", "manager"].includes(profile?.role ?? "")) {
     return NextResponse.json({ error: "Insufficient permissions" }, { status: 403 });
@@ -15,14 +14,16 @@ export async function POST(request: NextRequest) {
 
   try {
     const { sinceDate } = await request.json().catch(() => ({}));
-    const orders = await fetchShopifyOrders(sinceDate);
+    const stores = getShopifyStores();
+    if (stores.length === 0) return NextResponse.json({ error: "No Shopify stores configured" }, { status: 400 });
+
+    const orders = await fetchAllShopifyOrders(stores[0], sinceDate);
 
     let synced = 0;
     for (const order of orders) {
       const amount = Math.round(parseFloat(order.total_price) * 100);
       const txnId = `TXN-SHOPIFY-${order.id}`;
 
-      // Upsert by txn_id
       const { error } = await supabase.from("transactions").upsert({
         txn_id: txnId,
         type: "income",

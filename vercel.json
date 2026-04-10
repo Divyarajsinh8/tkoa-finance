@@ -1,0 +1,24 @@
+{
+  "crons": [
+    {
+      "path": "/api/sync/all",
+      "schedule": "0 */4 * * *"
+    },
+    {
+      "path": "/api/ai/briefing",
+      "schedule": "30 2 * * *"
+    },
+    {
+      "path": "/api/ai/anomaly-check",
+      "schedule": "0 */6 * * *"
+    },
+    {
+      "path": "/api/ai/weekly-report",
+      "schedule": "0 3 * * 1"
+    },
+    {
+      "path": "/api/ai/forecast",
+      "schedule": "0 4 * * 1"
+    }
+  ]
+}
