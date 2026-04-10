@@ -49,8 +49,10 @@ export default async function SettingsPage() {
       name: "Shopify — Store 1",
       desc: "TheKnockoutAutomations orders, customers, payouts",
       source: "shopify_TheKnockoutAutomations",
-      configured: !!process.env.SHOPIFY_STORE_1_TOKEN,
-      envVar: "SHOPIFY_STORE_1_TOKEN",
+      configured: !!(
+        process.env.SHOPIFY_STORE_1_CLIENT_ID && process.env.SHOPIFY_STORE_1_CLIENT_SECRET
+      ) || !!process.env.SHOPIFY_STORE_1_TOKEN,
+      envVar: "SHOPIFY_STORE_1_CLIENT_ID + SHOPIFY_STORE_1_CLIENT_SECRET",
     },
     {
       name: "Shopify — Store 2",
@@ -237,10 +239,12 @@ SUPABASE_SERVICE_ROLE_KEY=
 # AI
 ANTHROPIC_API_KEY=
 
-# Shopify Store 1
+# Shopify Store 1 (Partner Dashboard / Dev Dashboard app)
 SHOPIFY_STORE_1_URL=theknockoutautomations.myshopify.com
-SHOPIFY_STORE_1_TOKEN=
+SHOPIFY_STORE_1_CLIENT_ID=
+SHOPIFY_STORE_1_CLIENT_SECRET=
 SHOPIFY_STORE_1_NAME=TheKnockoutAutomations
+# SHOPIFY_STORE_1_TOKEN=  ← legacy static token, no longer needed
 
 # Shopify Store 2 (when ready)
 SHOPIFY_STORE_2_URL=

@@ -1,39 +1,118 @@
 // Shopify multi-store integration
-// Supports TheKnockoutAutomations + TheKnockoutAcademy
+// Store 1: uses Client ID + Client Secret (Shopify Dev Dashboard / Partner App)
+// Store 2: uses static access token (legacy shpat_ format)
 
 export interface ShopifyStore {
   url: string;
-  token: string;
   name: string;
+  // New: OAuth client credentials (Partner Dashboard apps)
+  clientId?: string;
+  clientSecret?: string;
+  // Legacy: static access token (Admin-created custom apps, shpat_...)
+  token?: string;
 }
+
+// ── In-memory token cache ────────────────────────────────────────────────────
+// Reuses exchanged tokens for 23 hours to avoid hitting the auth endpoint on
+// every API call. TTL is deliberately under 24 h in case Shopify rotates tokens.
+
+interface CachedToken {
+  token: string;
+  expiresAt: number; // Date.now() ms
+}
+
+const tokenCache = new Map<string, CachedToken>();
+const TOKEN_TTL_MS = 23 * 60 * 60 * 1000; // 23 hours
+
+/**
+ * Return a valid access token for a store.
+ * - Static token stores: returned directly.
+ * - Client-credentials stores: cached exchange; re-exchanges when close to expiry.
+ */
+async function getAccessToken(store: ShopifyStore): Promise<string> {
+  // Static token — no exchange needed
+  if (store.token) return store.token;
+
+  if (!store.clientId || !store.clientSecret) {
+    throw new Error(`Shopify [${store.name}]: no token or client credentials configured`);
+  }
+
+  // Check cache
+  const cacheKey = `${store.url}::${store.clientId}`;
+  const cached = tokenCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.token;
+
+  // Exchange client credentials for an access token
+  const res = await fetch(`https://${store.url}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: store.clientId,
+      client_secret: store.clientSecret,
+      grant_type: "client_credentials",
+    }),
+    next: { revalidate: 0 },
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => res.statusText);
+    throw new Error(`Shopify auth failed [${store.name}]: ${res.status} — ${body}`);
+  }
+
+  const data = await res.json();
+  const token: string = data.access_token;
+  if (!token) throw new Error(`Shopify auth [${store.name}]: empty access_token in response`);
+
+  tokenCache.set(cacheKey, { token, expiresAt: Date.now() + TOKEN_TTL_MS });
+  return token;
+}
+
+// ── Store configuration ──────────────────────────────────────────────────────
 
 export function getShopifyStores(): ShopifyStore[] {
   const stores: ShopifyStore[] = [];
 
-  if (process.env.SHOPIFY_STORE_1_URL && process.env.SHOPIFY_STORE_1_TOKEN) {
-    stores.push({
-      url: process.env.SHOPIFY_STORE_1_URL,
-      token: process.env.SHOPIFY_STORE_1_TOKEN,
-      name: process.env.SHOPIFY_STORE_1_NAME || "Store1",
-    });
+  // Store 1 — prefer client credentials, fall back to static token
+  if (process.env.SHOPIFY_STORE_1_URL) {
+    if (process.env.SHOPIFY_STORE_1_CLIENT_ID && process.env.SHOPIFY_STORE_1_CLIENT_SECRET) {
+      stores.push({
+        url: process.env.SHOPIFY_STORE_1_URL,
+        name: process.env.SHOPIFY_STORE_1_NAME || "Store1",
+        clientId: process.env.SHOPIFY_STORE_1_CLIENT_ID,
+        clientSecret: process.env.SHOPIFY_STORE_1_CLIENT_SECRET,
+      });
+    } else if (process.env.SHOPIFY_STORE_1_TOKEN) {
+      // Legacy fallback — static token still works
+      stores.push({
+        url: process.env.SHOPIFY_STORE_1_URL,
+        name: process.env.SHOPIFY_STORE_1_NAME || "Store1",
+        token: process.env.SHOPIFY_STORE_1_TOKEN,
+      });
+    }
   }
+
+  // Store 2 — static token (not yet migrated)
   if (process.env.SHOPIFY_STORE_2_URL && process.env.SHOPIFY_STORE_2_TOKEN) {
     stores.push({
       url: process.env.SHOPIFY_STORE_2_URL,
-      token: process.env.SHOPIFY_STORE_2_TOKEN,
       name: process.env.SHOPIFY_STORE_2_NAME || "Store2",
+      token: process.env.SHOPIFY_STORE_2_TOKEN,
     });
   }
-  // Fallback to legacy single-store env vars
+
+  // Legacy single-store env vars
   if (stores.length === 0 && process.env.SHOPIFY_STORE_URL && process.env.SHOPIFY_ACCESS_TOKEN) {
     stores.push({
       url: process.env.SHOPIFY_STORE_URL,
-      token: process.env.SHOPIFY_ACCESS_TOKEN,
       name: "TheKnockoutAutomations",
+      token: process.env.SHOPIFY_ACCESS_TOKEN,
     });
   }
+
   return stores;
 }
+
+// ── Shopify types ────────────────────────────────────────────────────────────
 
 export interface ShopifyOrder {
   id: string;
@@ -115,6 +194,8 @@ export interface ShopifyPayout {
   };
 }
 
+// ── Core fetch helper ────────────────────────────────────────────────────────
+
 async function shopifyFetch<T>(
   store: ShopifyStore,
   endpoint: string,
@@ -125,9 +206,11 @@ async function shopifyFetch<T>(
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
   }
 
+  const token = await getAccessToken(store);
+
   const res = await fetch(url.toString(), {
     headers: {
-      "X-Shopify-Access-Token": store.token,
+      "X-Shopify-Access-Token": token,
       "Content-Type": "application/json",
     },
     next: { revalidate: 0 },
@@ -138,6 +221,8 @@ async function shopifyFetch<T>(
   }
   return res.json();
 }
+
+// ── Order fetching (cursor-paginated) ────────────────────────────────────────
 
 export async function fetchShopifyOrders(
   store: ShopifyStore,
@@ -151,11 +236,13 @@ export async function fetchShopifyOrders(
   if (sinceDate) params.created_at_min = sinceDate;
   if (pageInfo) params.page_info = pageInfo;
 
+  const token = await getAccessToken(store);
+
   const res = await fetch(
     `https://${store.url}/admin/api/2024-01/orders.json?${new URLSearchParams(params)}`,
     {
       headers: {
-        "X-Shopify-Access-Token": store.token,
+        "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
       },
     }
@@ -186,7 +273,7 @@ export async function fetchAllShopifyOrders(
     const { orders, nextPageInfo } = await fetchShopifyOrders(store, sinceDate, pageInfo);
     allOrders.push(...orders);
     pageInfo = nextPageInfo;
-    if (pageInfo) await new Promise(r => setTimeout(r, 500)); // rate limit respect
+    if (pageInfo) await new Promise(r => setTimeout(r, 500)); // rate-limit respect
   } while (pageInfo);
 
   return allOrders;
@@ -227,19 +314,15 @@ export async function fetchShopifyPayouts(
   }
 }
 
-// Convert Shopify order to DB row
+// ── DB row mappers ───────────────────────────────────────────────────────────
+
 export function orderToDbRow(order: ShopifyOrder, storeName: string) {
-  const isNewCustomer =
-    order.customer?.orders_count === 1 || !order.customer;
-
-  const discountCode =
-    order.discount_codes?.[0]?.code ?? null;
-
+  const isNewCustomer = order.customer?.orders_count === 1 || !order.customer;
+  const discountCode = order.discount_codes?.[0]?.code ?? null;
   const shippingAmount = order.total_shipping_price_set?.shop_money
     ? Math.round(parseFloat(order.total_shipping_price_set.shop_money.amount) * 100)
     : 0;
 
-  // Extract UTM params from note_attributes or landing_site
   let utmSource: string | null = null;
   let utmMedium: string | null = null;
   let utmCampaign: string | null = null;
@@ -252,10 +335,13 @@ export function orderToDbRow(order: ShopifyOrder, storeName: string) {
     }
   }
 
-  // Parse from landing_site URL if not in note_attributes
   if (!utmSource && order.landing_site) {
     try {
-      const url = new URL(order.landing_site.startsWith("http") ? order.landing_site : `https://example.com${order.landing_site}`);
+      const url = new URL(
+        order.landing_site.startsWith("http")
+          ? order.landing_site
+          : `https://example.com${order.landing_site}`
+      );
       utmSource = url.searchParams.get("utm_source");
       utmMedium = url.searchParams.get("utm_medium");
       utmCampaign = url.searchParams.get("utm_campaign");
@@ -332,7 +418,8 @@ export function payoutToDbRow(payout: ShopifyPayout, storeName: string) {
   };
 }
 
-// Legacy compat — kept for existing /api/shopify/sync route
+// ── Convenience wrappers ─────────────────────────────────────────────────────
+
 export async function fetchShopifyOrders_legacy(sinceDate?: string): Promise<ShopifyOrder[]> {
   const stores = getShopifyStores();
   if (stores.length === 0) throw new Error("Shopify credentials not configured");
@@ -350,7 +437,7 @@ export async function getShopifyRevenue(month: Date): Promise<number> {
   for (const store of stores) {
     const orders = await fetchAllShopifyOrders(store, startOfMonth.toISOString());
     total += orders
-      .filter((o) => {
+      .filter(o => {
         const date = new Date(o.created_at);
         return date >= startOfMonth && date <= endOfMonth && o.financial_status === "paid";
       })
