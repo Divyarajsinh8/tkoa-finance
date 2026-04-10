@@ -2,27 +2,27 @@
   "crons": [
     {
       "path": "/api/sync/all",
-      "schedule": "0 */4 * * *"
+      "schedule": "0 2 * * *"
     },
     {
       "path": "/api/ai/briefing",
-      "schedule": "30 2 * * *"
+      "schedule": "0 3 * * *"
     },
     {
       "path": "/api/ai/anomaly-check",
-      "schedule": "0 */6 * * *"
+      "schedule": "0 4 * * *"
     },
     {
       "path": "/api/ai/weekly-report",
-      "schedule": "0 3 * * 1"
+      "schedule": "0 5 * * 1"
     },
     {
       "path": "/api/ai/forecast",
-      "schedule": "0 4 * * 1"
+      "schedule": "0 5 * * 1"
     },
     {
       "path": "/api/budget/check-alerts",
-      "schedule": "0 3 * * *"
+      "schedule": "0 6 * * *"
     }
   ]
 }
