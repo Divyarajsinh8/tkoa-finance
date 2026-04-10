@@ -1,9 +1,14 @@
 import { createClient } from "@/lib/supabase/server";
+import { TwoFactorSetup } from "./TwoFactorSetup";
 
 export default async function SettingsPage() {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
-  const { data: profile } = await supabase.from("users").select("*").single();
+  const { data: profile } = await supabase
+    .from("users")
+    .select("*, totp_enabled")
+    .eq("id", user?.id ?? "")
+    .single();
 
   // Get sync log for integration status
   const { data: syncLogs } = await supabase
@@ -182,6 +187,7 @@ export default async function SettingsPage() {
             { job: "Anomaly Detection", schedule: "Every 6 hours", endpoint: "/api/ai/anomaly-check" },
             { job: "Weekly Report", schedule: "Monday 8:30 AM IST", endpoint: "/api/ai/weekly-report" },
             { job: "Revenue Forecast", schedule: "Monday 9:30 AM IST", endpoint: "/api/ai/forecast" },
+            { job: "Budget Alert Check", schedule: "Daily 8:30 AM IST", endpoint: "/api/budget/check-alerts" },
           ].map(item => (
             <div key={item.job} className="flex items-center justify-between py-1">
               <div>
@@ -212,6 +218,12 @@ export default async function SettingsPage() {
         </div>
         <p className="text-white/25 text-xs mt-2">Set WEBHOOK_SECRET in .env.local and in Shopify webhook settings.</p>
       </div>
+
+      {/* 2FA */}
+      <TwoFactorSetup
+        isEnabled={profile?.totp_enabled ?? false}
+        isAdmin={profile?.role === "admin"}
+      />
 
       {/* Env reference */}
       <div className="card-base p-5">

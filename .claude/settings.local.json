@@ -4,7 +4,15 @@
       "Bash(npx tsc:*)",
       "Bash(npm run:*)",
       "Bash(node)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git rm:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(npm install:*)",
+      "Bash(node -e \"require\\('@react-pdf/renderer'\\); console.log\\('ok'\\)\")",
+      "Bash(node:*)",
+      "Bash(npx next:*)",
+      "Bash(git config:*)"
     ]
   }
 }

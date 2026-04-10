@@ -19,6 +19,10 @@
     {
       "path": "/api/ai/forecast",
       "schedule": "0 4 * * 1"
+    },
+    {
+      "path": "/api/budget/check-alerts",
+      "schedule": "0 3 * * *"
     }
   ]
 }
